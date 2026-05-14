@@ -94,7 +94,7 @@ class Scraper:
                     }
                 else:
                     launch_kwargs = {"headless": self.config.headless}
-                
+
                 # Try to use system Chrome first, fall back to bundled
                 system_chrome = os.environ.get(
                     "CROKCRAWL_CHROME_PATH",
@@ -106,7 +106,7 @@ class Scraper:
                     launch_kwargs["executable_path"] = "/usr/bin/chromium-browser"
                 elif os.path.exists("/usr/bin/google-chrome"):
                     launch_kwargs["executable_path"] = "/usr/bin/google-chrome"
-                
+
                 self._browser = await self._playwright.chromium.launch(**launch_kwargs)
                 self._context = await self._browser.new_context(
                     user_agent=self._client.headers.get("User-Agent"),
@@ -169,10 +169,15 @@ class Scraper:
         effective_js_render = render_js if render_js is not None else self.config.js_render
         effective_wait = wait_ms if wait_ms is not None else self.config.wait_for
 
+        # Determine wait_for_selector based on URL patterns
+        wait_for_selector = self._get_wait_selector(url)
+
         # If force_js_render is True, skip httpx and go directly to browser
         if force_js_render and self._context and effective_js_render:
             try:
-                browser_html, raw_text, final_url = await self._fetch_with_browser(url, wait_ms=effective_wait)
+                browser_html, raw_text, final_url = await self._fetch_with_browser(
+                    url, wait_ms=effective_wait, wait_for_selector=wait_for_selector
+                )
                 if browser_html:
                     result.html = browser_html
                     result.raw_text = raw_text
@@ -205,7 +210,9 @@ class Scraper:
                 is_spa = self._is_js_rendered(html, response)
                 if effective_js_render and is_spa:
                     if self._context:
-                        browser_html, raw_text, final = await self._fetch_with_browser(url, wait_ms=effective_wait)
+                        browser_html, raw_text, final = await self._fetch_with_browser(
+                            url, wait_ms=effective_wait, wait_for_selector=wait_for_selector
+                        )
                         if browser_html:
                             html = browser_html
                             result.raw_text = raw_text
@@ -304,13 +311,60 @@ class Scraper:
 
         return result
 
-    async def _fetch_with_browser(self, url: str, wait_ms: int = 500) -> tuple[str, str, str]:
-        """Fetch page using Playwright browser for full JS rendering.
-        
+    def _get_wait_selector(self, url: str) -> str | None:
+        """Return a CSS selector to wait for after page load, based on URL patterns.
+
+        This ensures dynamic content (like GitHub commit lists) is fully rendered
+        before we capture the page.
+        """
+        parsed = urlparse(url)
+        path = parsed.path.rstrip("/")
+
+        # GitHub commit list pages — wait for the commit timeline
+        if parsed.netloc == "github.com" and "/commits" in path:
+            return ".TimelineItem"
+
+        # GitHub pull request pages — wait for the PR timeline
+        if parsed.netloc == "github.com" and "/pulls" in path:
+            return ".TimelineItem"
+
+        # Generic commit pages
+        if parsed.netloc == "github.com" and path.endswith(("/commit", "/commits")):
+            return ".commit-actions"
+
+        # Discussions and some repo pages use the layout container
+        if parsed.netloc == "github.com" and any(x in path for x in ["/discussions", "/projects"]):
+            return ".Layout-main"
+
+        # Reddit uses the post listing
+        if parsed.netloc in ("reddit.com", "www.reddit.com"):
+            return ".Post"
+
+        # Twitter/X uses the timeline
+        if parsed.netloc in ("twitter.com", "www.twitter.com", "x.com", "www.x.com"):
+            return "[data-testid='timeline']"
+
+        # LinkedIn uses the feed container
+        if parsed.netloc in ("linkedin.com", "www.linkedin.com"):
+            return ".feed-shared-update-v2"
+
+        # Default: no specific selector needed
+        return None
+
+    async def _fetch_with_browser(
+        self,
+        url: str,
+        wait_ms: int = 500,
+        wait_for_selector: str | None = None,
+    ) -> tuple[str, str, str]:
+        """
+        Fetch URL via Playwright browser. Waits for JS-rendered content.
+
         Uses 'domcontentloaded' first to avoid Cloudflare JS challenge stalls,
         then waits explicitly for content. If Cloudflare block detected, retries
-        with longer wait.
-        
+        with longer wait. If wait_for_selector is provided, waits for that CSS
+        selector to appear before capturing content.
+
         Returns: (html, raw_text, final_url)
         """
         if not self._context:
@@ -320,23 +374,30 @@ class Scraper:
             # Use domcontentloaded instead of networkidle — Cloudflare challenges
             # sometimes prevent networkidle from ever firing
             await page.goto(url, wait_until="domcontentloaded", timeout=self.config.timeout * 1000)
-            
+
             # Wait for JS challenge to resolve or dynamic content to load
             if wait_ms > 0:
                 await page.wait_for_timeout(wait_ms)
-            
+
+            # Wait for a specific DOM element if provided (e.g., commit lists)
+            if wait_for_selector:
+                try:
+                    await page.wait_for_selector(wait_for_selector, timeout=15000)
+                except Exception:
+                    logger.debug("wait_for_selector '%s' not found, continuing", wait_for_selector)
+
             # Check if we got a Cloudflare block page
             html_data = await page.content()
             is_cf_block = "Cloudflare" in html_data or "blocked" in html_data[:2000].lower()
-            
+
             if is_cf_block:
                 logger.info("Cloudflare challenge detected, waiting longer for resolution...")
                 await page.wait_for_timeout(10000)
                 html_data = await page.content()
-            
+
             # Get raw visible text — what a human sees on the page
             raw_text = await page.inner_text("body")
-            
+
             final_url = page.url
             await page.close()
             return html_data, raw_text, final_url
