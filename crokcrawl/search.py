@@ -6,7 +6,7 @@ from typing import Optional, Any
 import httpx
 from bs4 import BeautifulSoup
 
-from crokrawl.url_validation import is_safe_url
+from crokcrawl.url_validation import is_safe_url
 
 logger = logging.getLogger(__name__)
 

@@ -11,7 +11,9 @@ from dataclasses import dataclass, field
 from typing import Optional, Any
 from urllib.parse import urlparse, urljoin
 
-from crokrawl.url_validation import is_safe_url
+from bs4 import BeautifulSoup
+
+from crokcrawl.url_validation import is_safe_url
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +48,7 @@ class Crawler:
         url: str,
         max_pages: int | None = None,
         max_depth: int | None = None,
+        allow_external: bool = False,
         **kwargs: Any,
     ) -> CrawlJob:
         """Start a new crawl job. Returns immediately — use get_job_status() to poll."""
@@ -57,10 +60,10 @@ class Crawler:
             status="running",
         )
         self._jobs[job.id] = job
-        asyncio.create_task(self._run_crawl(job, **kwargs))
+        asyncio.create_task(self._run_crawl(job, allow_external=allow_external, **kwargs))
         return job
 
-    async def _run_crawl(self, job: CrawlJob, **kwargs: Any):
+    async def _run_crawl(self, job: CrawlJob, allow_external: bool = False, **kwargs: Any):
         """Run BFS crawl in background with timeout."""
         job.status = "running"
         domain = urlparse(job.url).netloc
@@ -112,16 +115,19 @@ class Crawler:
                     "metadata": result.metadata,
                 })
 
-                # Extract same-domain links and add to queue
+                # Extract links and add to queue
                 if result.success and result.html and depth < job.max_depth:
-                    soup = __import__('bs4', fromlist=['BeautifulSoup']).BeautifulSoup(result.html, 'lxml')
+                    soup = BeautifulSoup(result.html, 'lxml')
                     for a in soup.find_all('a', href=True):
                         href = a['href']
                         if href.startswith(('#', 'mailto:', 'tel:', 'javascript:')):
                             continue
                         try:
                             full = urljoin(current_url, href)
-                            if urlparse(full).netloc == domain and full not in visited:
+                            if not allow_external:
+                                if urlparse(full).netloc != domain:
+                                    continue
+                            if full not in visited:
                                 queue.append((full, depth + 1))
                         except Exception:
                             continue

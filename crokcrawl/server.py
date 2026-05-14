@@ -3,7 +3,7 @@
 import logging
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
@@ -13,10 +13,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from crokrawl.config import config
-from crokrawl.scraper import Scraper, ScrapeResult
-from crokrawl.crawler import Crawler
-from crokrawl.search import SearchBackend
+from crokcrawl.config import config
+from crokcrawl.scraper import Scraper, ScrapeResult
+from crokcrawl.crawler import Crawler
+from crokcrawl.search import SearchBackend
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,7 +32,8 @@ class ScrapeRequest(BaseModel):
     include_tags: list[str] | None = None
     exclude_tags: list[str] | None = None
     render_js: bool | None = None
-    wait_for: int | None = None
+    force_js_render: bool = False  # Use Playwright even without SPA detection
+    wait_ms: int | None = None
     css_selector: str | None = None
     json_schema: dict | None = None
     # Removed: proxy (SSRF risk) — use server-side proxy config instead
@@ -55,7 +56,7 @@ class CrawlRequest(BaseModel):
     url: str
     max_depth: int = Field(default=2, ge=1, le=10)
     max_pages: int = Field(default=50, ge=1, le=500)
-    allow_external: bool = True
+    allow_external: bool = False
     ignore_sitemap: bool = False
 
 
@@ -63,28 +64,30 @@ class MapRequest(BaseModel):
     url: str
     max_depth: int = Field(default=2, ge=1, le=10)
     use_sitemap: bool = True
+    max_urls: int = Field(default=1000, ge=1, le=10000)  # cap for URL discovery
 
 
 # ─── Authentication middleware ────────────────────────────────────────────────
 
-def _check_api_key(request: Request) -> None:
-    """Validate the API key from the Authorization header or x-api-key header."""
-    if not config.api_key:
-        return  # No auth configured — allow all
+def _check_api_key(request: Request) -> Optional[JSONResponse]:
+    """Validate the API key. Returns None if allowed, or a 401 JSONResponse if not.
 
-    # Check Authorization: Bearer <key>
+    Returning a response (rather than raising HTTPException) is required because
+    Starlette's BaseHTTPMiddleware does not catch FastAPI HTTPException — a raise
+    here would surface as a 500 to the client.
+    """
+    if not config.api_key:
+        return None  # No auth configured — allow all
+
     auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        token = auth_header[7:]
-        if token == config.api_key:
-            return
-        # Check x-api-key header as fallback
-    api_key = request.headers.get("x-api-key", "")
-    if api_key == config.api_key:
-        return
+    if auth_header.startswith("Bearer ") and auth_header[7:] == config.api_key:
+        return None
+
+    if request.headers.get("x-api-key", "") == config.api_key:
+        return None
 
     logger.warning("Authentication failed from %s", request.client.host if request.client else "unknown")
-    raise HTTPException(status_code=401, detail="Authentication required")
+    return JSONResponse(status_code=401, content={"detail": "Authentication required"})
 
 
 # ─── Rate limiting middleware ─────────────────────────────────────────────────
@@ -94,27 +97,32 @@ class SimpleRateLimiter:
 
     def __init__(self, max_requests: int = 60):
         self.max_requests = max_requests
-        self._requests: dict[str, list[float]] = defaultdict(list)
+        self._requests: dict[str, deque] = defaultdict(lambda: deque(maxlen=max_requests))
 
     def is_allowed(self, client_ip: str) -> bool:
         """Return True if the request is allowed. Sliding window."""
         now = time.time()
-        window = 60.0  # 1 minute
-        self._requests[client_ip] = [
-            t for t in self._requests[client_ip] if now - t < window
-        ]
-        if len(self._requests[client_ip]) >= self.max_requests:
+        window = 60.0
+        timestamps = self._requests[client_ip]
+        # Remove timestamps older than the window
+        while timestamps and now - timestamps[0] >= window:
+            timestamps.popleft()
+        if len(timestamps) >= self.max_requests:
             return False
-        self._requests[client_ip].append(now)
+        timestamps.append(now)
         return True
 
     def cleanup(self) -> int:
         """Remove entries older than 2 minutes. Returns count removed."""
         now = time.time()
-        stale = [ip for ip, times in self._requests.items() if not any(now - t < 120 for t in times)]
-        for ip in stale:
-            del self._requests[ip]
-        return len(stale)
+        removed = 0
+        for ip, timestamps in list(self._requests.items()):
+            while timestamps and now - timestamps[0] >= 120:
+                timestamps.popleft()
+            if not timestamps:
+                del self._requests[ip]
+                removed += 1
+        return removed
 
 
 _rate_limiter = SimpleRateLimiter(config.rate_limit_rpm)
@@ -131,7 +139,7 @@ search_backend: Optional[SearchBackend] = None
 async def lifespan(app: FastAPI):
     global scraper, crawler, search_backend
 
-    logger.info("Starting crokrawl...")
+    logger.info("Starting crokcrawl...")
     scraper = Scraper(config)
     await scraper.start()
     crawler = Crawler(scraper, config)
@@ -156,9 +164,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="crokrawl",
-    description="Open-source web scraping API",
-    version="0.1.0",
+    title="crokcrawl",
+    description="Open-source web scraping API with JS rendering",
+    version="0.2.1",
     lifespan=lifespan,
 )
 
@@ -176,16 +184,19 @@ app.add_middleware(
 async def auth_middleware(request: Request, call_next):
     """Check API key for all protected endpoints (except /health)."""
     if request.url.path != "/health" and not request.url.path.startswith("/openapi") and not request.url.path.startswith("/docs"):
-        _check_api_key(request)
+        auth_result = _check_api_key(request)
+        if auth_result:
+            return auth_result
 
-    # Rate limiting
-    client_ip = request.client.host if request.client else "unknown"
-    if not _rate_limiter.is_allowed(client_ip):
-        return JSONResponse(
-            status_code=429,
-            content={"detail": "Rate limit exceeded"},
-            headers={"Retry-After": "60"},
-        )
+    # Rate limiting — skip for health check
+    if request.url.path != "/health":
+        client_ip = request.client.host if request.client else "unknown"
+        if not _rate_limiter.is_allowed(client_ip):
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded"},
+                headers={"Retry-After": "60"},
+            )
 
     response = await call_next(request)
     return response
@@ -224,7 +235,7 @@ async def capabilities():
     return {
         "formats": ["markdown", "html", "rawHtml", "plainText", "links", "json", "summary"],
         "scrape": {
-            "js_render": True,
+            "js_render": bool(scraper._js_render_available) if scraper else False,
             "stealth": config.stealth,
         },
         "search": {"available": bool(search_backend)},
@@ -236,8 +247,8 @@ async def scrape(req: ScrapeRequest):
     """Scrape a URL into clean Markdown.
 
     Firecrawl-compatible: POST /v1/scrape
-    Request: {\"url\": \"...\", \"formats\": [\"markdown\"]}
-    Response: {\"success\": true, \"data\": {\"markdown\": \"...\", \"metadata\": {...}}}
+    Request: {"url": "...", "formats": ["markdown"]}
+    Response: {"success": true, "data": {"markdown": "...", "metadata": {...}}}
     """
     result: ScrapeResult = await scraper.scrape(
         url=req.url,
@@ -246,7 +257,8 @@ async def scrape(req: ScrapeRequest):
         include_tags=req.include_tags,
         exclude_tags=req.exclude_tags,
         render_js=req.render_js,
-        wait_for=req.wait_for,
+        force_js_render=req.force_js_render,
+        wait_ms=req.wait_ms,
     )
 
     if not result.success:
@@ -273,6 +285,7 @@ async def scrape(req: ScrapeRequest):
         "sourceURL": result.source_url,
         "statusCode": result.status_code,
         "description": result.description,
+        "is_js_rendered": result.is_js_rendered,
     }
     data["metadata"].update(result.metadata)
 
@@ -334,6 +347,7 @@ async def crawl(req: CrawlRequest):
         url=req.url,
         max_pages=req.max_pages,
         max_depth=req.max_depth,
+        allow_external=req.allow_external,
     )
 
     return {
@@ -383,7 +397,7 @@ async def map_urls(req: MapRequest):
     Request: {\"url\": \"...\"}
     Response: {\"success\": true, \"links\": [\"url1\", \"url2\", ...]}
     """
-    urls = await scraper.map_urls(req.url, max_depth=req.max_depth)
+    urls = await scraper.map_urls(req.url, max_depth=req.max_depth, max_urls=req.max_urls)
 
     return {
         "success": True,
@@ -396,4 +410,4 @@ async def map_urls(req: MapRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("crokrawl.server:app", host="0.0.0.0", port=config.port, reload=False)
+    uvicorn.run("crokcrawl.server:app", host="0.0.0.0", port=config.port, reload=False)

@@ -13,10 +13,10 @@ A self-hosted, minimal Firecrawl-compatible API. Drop it in, set `FIRECRAWL_API_
 ## Quick Start
 
 ```bash
-cd ~/.hermes/crokrawl
+cd ~/.hermes/crokcrawl
 uv sync
 uv run playwright install chromium
-uv run uvicorn crokrawl.server:app --host 0.0.0.0 --port 8000
+uv run uvicorn crokcrawl.server:app --host 0.0.0.0 --port 8000
 ```
 
 ## Firecrawl Compatibility
