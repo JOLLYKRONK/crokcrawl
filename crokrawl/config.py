@@ -1,20 +1,36 @@
 """Configuration — all settings via environment variables."""
 
 import os
+import socket
 from dataclasses import dataclass, field
 from typing import Optional
 
 
 def _validate_url(val: str, name: str) -> str:
-    """Validate a URL configuration value. Returns cleaned URL or raises ValueError."""
+    """Validate a URL configuration value. Returns cleaned URL or raises ValueError.
+
+    DNS resolution is deferred — if the hostname is unreachable at import time,
+    the raw value is kept and a warning is logged instead of crashing the entire app.
+    Runtime usage (SearXNG search, etc.) will validate again before making requests.
+    """
     from crokrawl.url_validation import is_safe_url
     cleaned = val.rstrip("/")
-    if cleaned:
-        # Allow localhost for internal backends (SearXNG, etc.)
-        parsed_url = __import__('urllib.parse').parse.urlparse(cleaned)
-        hostname = (parsed_url.hostname or "").lower()
-        if hostname not in ("localhost", "127.0.0.1") and not is_safe_url(cleaned):
-            raise ValueError(f"{name} must not resolve to a private/internal address: {val}")
+    if not cleaned:
+        return cleaned
+    parsed_url = __import__('urllib.parse').parse.urlparse(cleaned)
+    hostname = (parsed_url.hostname or "").lower()
+    if hostname not in ("localhost", "127.0.0.1", "0.0.0.0"):
+        try:
+            if not is_safe_url(cleaned):
+                raise ValueError(f"{name} must not resolve to a private/internal address: {val}")
+        except socket.gaierror:
+            # DNS can't resolve the backend yet (common in containerized setups).
+            # Defer validation to first use.
+            import logging
+            logging.getLogger(__name__).warning(
+                "%s DNS resolution failed for '%s' — url will be validated at runtime",
+                name, cleaned,
+            )
     return cleaned
 
 
@@ -44,6 +60,7 @@ class Config:
     searxng_api_key: Optional[str] = os.environ.get("CROKRAWL_SEARXNG_API_KEY") or None
     max_concurrency: int = int(os.environ.get("CROKRAWL_MAX_CONCURRENCY", "4"))
     stealth: bool = os.environ.get("CROKRAWL_STEALTH", "true").lower() == "true"
+    stealth_level: str = os.environ.get("CROKRAWL_STEALTH_LEVEL", "basic")  # basic, enhanced
     timeout: int = int(os.environ.get("CROKRAWL_TIMEOUT", "30"))
     wait_for: int = int(os.environ.get("CROKRAWL_WAIT_FOR", "500"))
     headless: bool = os.environ.get("CROKRAWL_HEADLESS", "true").lower() == "true"

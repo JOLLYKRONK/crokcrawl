@@ -32,6 +32,7 @@ class ScrapeRequest(BaseModel):
     include_tags: list[str] | None = None
     exclude_tags: list[str] | None = None
     render_js: bool | None = None
+    force_js_render: bool = False  # Use Playwright even without SPA detection
     wait_for: int | None = None
     css_selector: str | None = None
     json_schema: dict | None = None
@@ -67,24 +68,25 @@ class MapRequest(BaseModel):
 
 # ─── Authentication middleware ────────────────────────────────────────────────
 
-def _check_api_key(request: Request) -> None:
-    """Validate the API key from the Authorization header or x-api-key header."""
-    if not config.api_key:
-        return  # No auth configured — allow all
+def _check_api_key(request: Request) -> Optional[JSONResponse]:
+    """Validate the API key. Returns None if allowed, or a 401 JSONResponse if not.
 
-    # Check Authorization: Bearer <key>
+    Returning a response (rather than raising HTTPException) is required because
+    Starlette's BaseHTTPMiddleware does not catch FastAPI HTTPException — a raise
+    here would surface as a 500 to the client.
+    """
+    if not config.api_key:
+        return None  # No auth configured — allow all
+
     auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        token = auth_header[7:]
-        if token == config.api_key:
-            return
-        # Check x-api-key header as fallback
-    api_key = request.headers.get("x-api-key", "")
-    if api_key == config.api_key:
-        return
+    if auth_header.startswith("Bearer ") and auth_header[7:] == config.api_key:
+        return None
+
+    if request.headers.get("x-api-key", "") == config.api_key:
+        return None
 
     logger.warning("Authentication failed from %s", request.client.host if request.client else "unknown")
-    raise HTTPException(status_code=401, detail="Authentication required")
+    return JSONResponse(status_code=401, content={"detail": "Authentication required"})
 
 
 # ─── Rate limiting middleware ─────────────────────────────────────────────────
@@ -158,7 +160,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="crokrawl",
     description="Open-source web scraping API",
-    version="0.1.0",
+    version=__import__("crokrawl").__version__,
     lifespan=lifespan,
 )
 
@@ -174,21 +176,30 @@ app.add_middleware(
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Check API key for all protected endpoints (except /health)."""
-    if request.url.path != "/health" and not request.url.path.startswith("/openapi") and not request.url.path.startswith("/docs"):
-        _check_api_key(request)
+    """Check API key for all protected endpoints (except /health and OpenAPI docs)."""
+    path = request.url.path
+    is_unauthenticated_path = (
+        path == "/health"
+        or path.startswith("/openapi")
+        or path.startswith("/docs")
+        or path.startswith("/redoc")
+    )
+    if not is_unauthenticated_path:
+        auth_response = _check_api_key(request)
+        if auth_response is not None:
+            return auth_response
 
-    # Rate limiting
-    client_ip = request.client.host if request.client else "unknown"
-    if not _rate_limiter.is_allowed(client_ip):
-        return JSONResponse(
-            status_code=429,
-            content={"detail": "Rate limit exceeded"},
-            headers={"Retry-After": "60"},
-        )
+    # Rate limit everything except /health so load-balancer probes don't trip the limiter.
+    if path != "/health":
+        client_ip = request.client.host if request.client else "unknown"
+        if not _rate_limiter.is_allowed(client_ip):
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded"},
+                headers={"Retry-After": "60"},
+            )
 
-    response = await call_next(request)
-    return response
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -220,11 +231,17 @@ async def health():
 
 @app.get("/v1/capabilities")
 async def capabilities():
-    """Report supported features — Firecrawl-compatible."""
+    """Report supported features — Firecrawl-compatible.
+
+    `js_render` reflects whether the Playwright browser successfully initialized
+    at startup, not just whether the feature is requested in config. This lets
+    clients branch on the actual capability rather than the intent.
+    """
+    js_render_available = bool(scraper and scraper._js_render_available)
     return {
         "formats": ["markdown", "html", "rawHtml", "plainText", "links", "json", "summary"],
         "scrape": {
-            "js_render": True,
+            "js_render": js_render_available,
             "stealth": config.stealth,
         },
         "search": {"available": bool(search_backend)},
@@ -246,6 +263,7 @@ async def scrape(req: ScrapeRequest):
         include_tags=req.include_tags,
         exclude_tags=req.exclude_tags,
         render_js=req.render_js,
+        force_js_render=req.force_js_render,
         wait_for=req.wait_for,
     )
 

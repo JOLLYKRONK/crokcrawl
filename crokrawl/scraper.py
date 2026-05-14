@@ -1,12 +1,11 @@
-"""Content scraper — httpx + readability-lxml + markdownify.
+"""Content scraper — httpx + readability-lxml + markdownify with optional Playwright.
 
-No browser required. Handles ~80% of the web (static HTML).
-For JS-rendered pages (SPAs), results will be incomplete — we note this in metadata.
+Handles ~80% of the web with httpx (static HTML).
+For JS-rendered pages (SPAs), uses Playwright Chromium when enabled.
 """
 
 import json
 import logging
-import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional, Any
@@ -18,20 +17,20 @@ from markdownify import markdownify
 from readability import Document
 
 from crokrawl.url_validation import is_safe_url
-
+from crokrawl.stealth import STEALTH_INIT_SCRIPT, STEALTH_ARGS
 
 logger = logging.getLogger(__name__)
 
 # HTML pages that are likely JS-rendered (SPA detection)
 SPA_INDICATORS = [
-    'id="__next"',           # Next.js
-    '__NEXT_DATA__',        # Next.js data
-    '__NUXT__',             # Nuxt.js
-    '__REDUX__',            # Redux
-    '__APOLLO_STATE__',     # Apollo/GraphQL
-    'data-reactroot',       # React
-    'angular-version',      # Angular
-    'vue-app',              # Vue.js
+    'id="__next"',
+    '__NEXT_DATA__',
+    '__NUXT__',
+    '__REDUX__',
+    '__APOLLO_STATE__',
+    'data-reactroot',
+    'angular-version',
+    'vue-app',
 ]
 
 
@@ -42,40 +41,95 @@ class ScrapeResult:
     url: str = ""
     markdown: str = ""
     html: str = ""
+    raw_text: str = ""
     title: str = ""
     description: str = ""
     source_url: str = ""
     status_code: int = 0
     error: str = ""
     metadata: dict = field(default_factory=dict)
-    is_js_rendered: bool = False  # True if page likely needs JS rendering
+    is_js_rendered: bool = False
 
 
 class Scraper:
     """Content scraper using httpx + readability-lxml + markdownify.
 
-    Works without a browser. For JS-rendered pages, results may be incomplete.
+    Falls back to Playwright Chromium for JS-rendered pages when enabled.
     """
 
     def __init__(self, config):
         self.config = config
         self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0, connect=10.0),
+            timeout=httpx.Timeout(
+                connect=10.0,
+                read=float(config.timeout),
+                write=10.0,
+                pool=5.0,
+            ),
             follow_redirects=True,
             headers={
-                "User-Agent": "crokrawl/0.1",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
-                "Accept-Encoding": "identity",  # Don't compress — readability needs raw HTML
+                "Accept-Encoding": "identity",
             },
         )
+        self._context = None
+        self._browser = None
+        self._playwright = None
+        self._js_render_available = False
 
     async def start(self):
-        """Initialize scraper (no browser needed)."""
-        pass
+        """Initialize scraper and optionally launch Playwright browser with anti-detection."""
+        if self.config.js_render:
+            try:
+                from playwright.async_api import async_playwright
+                self._playwright = await async_playwright().start()
+                if self.config.stealth:
+                    # Use stealth browser args and init scripts to bypass automation detection
+                    launch_kwargs = {
+                        "headless": self.config.headless,
+                        "args": STEALTH_ARGS,
+                    }
+                else:
+                    launch_kwargs = {"headless": self.config.headless}
+                self._browser = await self._playwright.chromium.launch(**launch_kwargs)
+                self._context = await self._browser.new_context(
+                    user_agent=self._client.headers.get("User-Agent"),
+                    viewport={"width": 1920, "height": 1080},
+                    locale="en-US",
+                    timezone_id="America/New_York",
+                    permissions=["geolocation"],
+                )
+                if self.config.stealth:
+                    await self._context.add_init_script(STEALTH_INIT_SCRIPT)
+                self._js_render_available = True
+                logger.info("Playwright browser initialized for JS rendering (stealth=%s)", self.config.stealth)
+            except Exception as e:
+                logger.warning("Playwright unavailable, falling back to httpx only: %s", e)
+                self._js_render_available = False
+                await self._teardown_browser()
+
+    async def _teardown_browser(self):
+        """Best-effort teardown of Playwright resources."""
+        for attr, closer in (
+            ("_context", "close"),
+            ("_browser", "close"),
+            ("_playwright", "stop"),
+        ):
+            obj = getattr(self, attr, None)
+            if obj is None:
+                continue
+            try:
+                await getattr(obj, closer)()
+            except Exception as e:
+                logger.warning("Error closing %s: %s", attr, e)
+            setattr(self, attr, None)
+        self._js_render_available = False
 
     async def stop(self):
-        """Close HTTP client."""
+        """Close HTTP client and Playwright resources."""
+        await self._teardown_browser()
         await self._client.aclose()
 
     async def scrape(
@@ -83,144 +137,195 @@ class Scraper:
         url: str,
         formats: list[str] | None = None,
         only_main_content: bool = True,
-        include_tags: list[str] | None = None,
-        exclude_tags: list[str] | None = None,
         render_js: bool | None = None,
+        force_js_render: bool = False,
         wait_for: int | None = None,
         **kwargs: Any,
     ) -> ScrapeResult:
-        """Scrape a single URL.
-
-        Args:
-            url: URL to scrape
-            formats: Output formats (markdown, html, links, plainText, json)
-            only_main_content: Extract only main content via Readability
-            render_js: Ignored (no browser). Pages needing JS will be noted.
-            wait_for: Ignored (no browser).
-        """
+        """Scrape a single URL. Uses httpx first, then Playwright if JS-rendered or forced."""
         result = ScrapeResult(url=url)
 
-        # SSRF protection — block private/internal URLs
         if not is_safe_url(url):
             result.success = False
-            result.error = f"Access denied: URL targets a private/internal address"
-            logger.warning("Blocked scrape request to: %s", url)
+            result.error = "Access denied: URL targets a private/internal address"
             return result
 
-        try:
-            # Fetch page
-            response = await self._client.get(url)
+        effective_js_render = render_js if render_js is not None else self.config.js_render
+        effective_wait = wait_for if wait_for is not None else self.config.wait_for
 
-            # Redirect SSRF check — validate the final URL after redirects
-            final_url = str(response.url)
-            if final_url != url and not is_safe_url(final_url):
+        # If force_js_render is True, skip httpx and go directly to browser
+        if force_js_render and self._context and effective_js_render:
+            try:
+                browser_html, raw_text, final_url = await self._fetch_with_browser(url, wait_ms=effective_wait)
+                if browser_html:
+                    result.html = browser_html
+                    result.raw_text = raw_text
+                    result.source_url = final_url
+                    result.success = True
+                    result.status_code = 200
+                else:
+                    result.success = False
+                    result.error = "Browser fetch returned empty content"
+                    return result
+            except Exception as e:
                 result.success = False
-                result.error = "Redirect blocked (SSRF prevention)"
-                logger.warning("Blocked redirect to internal address: %s -> %s", url, final_url)
+                result.error = f"Browser fetch failed: {e}"
                 return result
+        else:
+            try:
+                response = await self._client.get(url)
+                final_url = str(response.url)
+                if final_url != url and not is_safe_url(final_url):
+                    result.success = False
+                    result.error = "Redirect blocked (SSRF prevention)"
+                    return result
 
-            result.status_code = response.status_code
-            html = response.text
-            result.html = html
-            result.source_url = url
+                result.status_code = response.status_code
+                html = response.text
 
-            # Detect JS-rendered pages
-            if self._is_js_rendered(html, response):
-                result.is_js_rendered = True
-                logger.info("Page likely JS-rendered (SPA): %s", url)
-
-            # Parse HTML
-            soup = BeautifulSoup(html, "lxml")
-
-            # Extract title
-            result.title = self._extract_title(soup)
-
-            # Extract description
-            result.description = self._extract_description(soup)
-
-            if only_main_content:
-                # Use Readability for main content extraction
-                doc = Document(html, min_text_length=50)
-                article_html = doc.summary()
-                article_title = doc.title()
-
-                if article_title:
-                    result.title = article_title
-
-                # Convert to markdown
-                result.markdown = _html_to_markdown(article_html)
-
-                # Fallback: if Readability extracted nothing, try body directly
-                if not result.markdown.strip() and len(html) > 2000:
-                    body = soup.find("body")
-                    if body:
-                        result.markdown = _html_to_markdown(str(body))
-                        result.metadata["extraction_method"] = "fallback-body"
+                # Re-fetch with Playwright if JS-rendered and browser available
+                is_spa = self._is_js_rendered(html, response)
+                if effective_js_render and is_spa:
+                    if self._context:
+                        browser_html, raw_text, final = await self._fetch_with_browser(url, wait_ms=effective_wait)
+                        if browser_html:
+                            html = browser_html
+                            result.raw_text = raw_text
+                            result.source_url = final
+                        else:
+                            result.source_url = final_url
                     else:
-                        result.markdown = _html_to_markdown(html)
-                        result.metadata["extraction_method"] = "fallback-full"
-                else:
-                    result.metadata["extraction_method"] = "readability"
-
-                # Post-extraction check: if Readability got very little from a large page,
-                # it's likely JS-rendered (UI text is there but article content is empty)
-                if (result.metadata.get("extraction_method") == "readability"
-                    and len(html) > 50000
-                    and len(result.markdown) < 1000):
-                    result.is_js_rendered = True
-                    if not result.metadata.get("warning"):
-                        result.metadata["warning"] = (
-                            "This page appears to be JS-rendered (SPA). "
-                            "Content may be incomplete. Use a browser-based scraper for full rendering."
+                        # SPA detected but Playwright not available — warn client
+                        result.source_url = final_url
+                        result.metadata["js_render_skipped"] = True
+                        result.metadata["js_render_reason"] = "Playwright browser not available"
+                        result.metadata["extraction_method"] = "httpx-only-spa-detected"
+                        logger.warning(
+                            "SPA detected for %s but Playwright unavailable — returning limited shell content", url,
                         )
-            else:
-                # Use full page
-                body = soup.find("body")
-                if body:
-                    result.markdown = _html_to_markdown(str(body))
                 else:
-                    result.markdown = _html_to_markdown(html)
+                    result.source_url = final_url
 
-            # Extract links
-            if formats and "links" in formats:
-                result.metadata["links"] = self._extract_links(soup, url)
+                # Set is_js_rendered flag for client awareness
+                if is_spa:
+                    result.is_js_rendered = True
+                    if not self._context and effective_js_render:
+                        result.metadata["js_render_skipped"] = True
+                        result.metadata["js_render_reason"] = "Playwright browser not available"
 
-            # Extract structured data
-            if formats and "json" in formats:
-                result.metadata["structured_data"] = self._extract_structured_data(soup)
+                result.html = html
+                soup = BeautifulSoup(html, "lxml")
+                result.title = self._extract_title(soup)
+                result.description = self._extract_description(soup)
 
-            # Note JS-rendered pages
-            if result.is_js_rendered:
-                result.metadata["warning"] = (
-                    "This page appears to be JS-rendered (SPA). "
-                    "Content may be incomplete. Use a browser-based scraper for full rendering."
-                )
+                if only_main_content:
+                    doc = Document(html, min_text_length=50)
+                    article_html = doc.summary()
+                    article_title = doc.title()
+                    if article_title:
+                        result.title = article_title
+                    result.markdown = _html_to_markdown(article_html)
+                    if not result.markdown.strip() and len(html) > 2000:
+                        body = soup.find("body")
+                        result.markdown = _html_to_markdown(str(body) if body else html)
+                        if not result.markdown.strip():
+                            result.markdown = _html_to_markdown(html)
+                            result.metadata["extraction_method"] = "fallback-full"
+                        else:
+                            result.metadata["extraction_method"] = "fallback-body"
+                    else:
+                        result.metadata["extraction_method"] = "readability"
+                else:
+                    body = soup.find("body")
+                    result.markdown = _html_to_markdown(str(body) if body else html)
 
-        except httpx.HTTPError as e:
-            result.success = False
-            result.error = "Failed to fetch page"
-            logger.error("Scrape HTTP error for %s: %s", url, e)
-        except Exception as e:
-            result.success = False
-            result.error = "Scrape failed"
-            logger.error("Scrape error for %s: %s", url, e)
+                if formats and "links" in formats:
+                    result.metadata["links"] = self._extract_links(soup, url)
+                if formats and "json" in formats:
+                    result.metadata["structured_data"] = self._extract_structured_data(soup)
+
+            except httpx.HTTPError as e:
+                result.success = False
+                result.error = "Failed to fetch page"
+                logger.error("Scrape HTTP error for %s: %s", url, e)
+            except Exception as e:
+                result.success = False
+                result.error = "Scrape failed"
+                logger.error("Scrape error for %s: %s", url, e)
+
+        # Post-process: parse markdown from HTML if browser was used
+        if result.success and result.html and not result.markdown:
+            soup = BeautifulSoup(result.html, "lxml")
+            result.title = self._extract_title(soup)
+            result.description = self._extract_description(soup)
+            if only_main_content:
+                try:
+                    doc = Document(result.html, min_text_length=50)
+                    article_html = doc.summary()
+                    result.markdown = _html_to_markdown(article_html)
+                    result.metadata["extraction_method"] = "readability"
+                except Exception:
+                    body = soup.find("body")
+                    result.markdown = _html_to_markdown(str(body) if body else result.html)
+                    result.metadata["extraction_method"] = "fallback-body"
+                if formats and "links" in formats:
+                    result.metadata["links"] = self._extract_links(soup, url)
+                if formats and "json" in formats:
+                    result.metadata["structured_data"] = self._extract_structured_data(soup)
+            else:
+                body = soup.find("body")
+                result.markdown = _html_to_markdown(str(body) if body else result.html)
 
         return result
 
-    async def map_urls(self, url: str, max_depth: int = 2) -> list[str]:
-        """Discover URLs on a domain without scraping content.
-
-        Fetches pages, extracts links, follows same-origin URLs.
+    async def _fetch_with_browser(self, url: str, wait_ms: int = 500) -> tuple[str, str, str]:
+        """Fetch page using Playwright browser for full JS rendering.
+        
+        Uses 'domcontentloaded' first to avoid Cloudflare JS challenge stalls,
+        then waits explicitly for content. If Cloudflare block detected, retries
+        with longer wait.
+        
+        Returns: (html, raw_text, final_url)
         """
+        if not self._context:
+            return "", "", url
+        try:
+            page = await self._context.new_page()
+            # Use domcontentloaded instead of networkidle — Cloudflare challenges
+            # sometimes prevent networkidle from ever firing
+            await page.goto(url, wait_until="domcontentloaded", timeout=self.config.timeout * 1000)
+            
+            # Wait for JS challenge to resolve or dynamic content to load
+            if wait_ms > 0:
+                await page.wait_for_timeout(wait_ms)
+            
+            # Check if we got a Cloudflare block page
+            html_data = await page.content()
+            is_cf_block = "Cloudflare" in html_data or "blocked" in html_data[:2000].lower()
+            
+            if is_cf_block:
+                logger.info("Cloudflare challenge detected, waiting longer for resolution...")
+                await page.wait_for_timeout(10000)
+                html_data = await page.content()
+            
+            # Get raw visible text — what a human sees on the page
+            raw_text = await page.inner_text("body")
+            
+            final_url = page.url
+            await page.close()
+            return html_data, raw_text, final_url
+        except Exception as e:
+            logger.error("Browser fetch error for %s: %s", url, e)
+            return "", "", url
+
+    async def map_urls(self, url: str, max_depth: int = 2) -> list[str]:
+        """Discover URLs on a domain without scraping content."""
         result_urls: set[str] = set()
         visited: set[str] = set()
-        queue: list[tuple[str, int]] = [(url, 0)]
-
+        queue = [(url, 0)]
         domain = urlparse(url).netloc
 
-        # SSRF protection — validate initial URL
         if not is_safe_url(url):
-            logger.warning("Blocked map request (SSRF): %s", url)
             return []
 
         while queue and len(visited) < 1000:
@@ -228,130 +333,79 @@ class Scraper:
             if current_url in visited or depth > max_depth:
                 continue
             visited.add(current_url)
-
             try:
                 response = await self._client.get(current_url, timeout=10)
                 if response.status_code == 200:
                     result_urls.add(current_url)
-
-                    # Extract same-domain links
                     soup = BeautifulSoup(response.text, "lxml")
                     for a_tag in soup.find_all("a", href=True):
                         href = a_tag["href"]
-                        # Skip anchors, mailto, tel, javascript
                         if href.startswith(("#", "mailto:", "tel:", "javascript:")):
                             continue
                         full_url = urljoin(current_url, href)
-                        try:
-                            parsed = urlparse(full_url)
-                            if parsed.netloc == domain and full_url not in visited:
-                                queue.append((full_url, depth + 1))
-                        except Exception:
-                            continue
-
+                        if urlparse(full_url).netloc == domain and full_url not in visited:
+                            queue.append((full_url, depth + 1))
             except Exception:
                 pass
-
         return sorted(result_urls)
 
     def _is_js_rendered(self, html: str, response) -> bool:
         """Detect if page is likely JS-rendered (SPA)."""
         lower = html.lower()
-
-        # Check for known SPA indicators in HTML
         if any(indicator in lower for indicator in SPA_INDICATORS):
             return True
 
-        # Check for webpack/runtime bootstrapping patterns in scripts
-        webpack_patterns = [
-            '__webpack_require__',
-            'runtime:',
-            'module.exports=',
-            '__react_refresh_',
-            'hotUpdate',
-            'registerModule',
-        ]
-        if any(p in lower for p in webpack_patterns):
-            # Only flag if combined with other signs (many sites use webpack but render server-side)
-            soup = BeautifulSoup(html, "lxml")
-            # Check if main content area is empty
-            main = soup.find(['main', 'article', '#content', '.content', '.main'])
-            if main:
-                main_text = main.get_text(strip=True)
-                if len(main_text) < 100:
-                    return True
-
-        # Check for empty body (server returns empty shell, JS fills it)
         soup = BeautifulSoup(html, "lxml")
         body = soup.find("body")
-        if body:
-            body_text = body.get_text(strip=True)
-            # If body has very little text but page is large, it's likely JS-rendered
-            if len(html) > 5000 and len(body_text) < 200:
-                return True
+        if not body:
+            return False
 
-            # Check for common empty-body patterns
-            if body_text.strip() in ("", "Loading...", "Please wait"):
-                return True
+        body_text = body.get_text(strip=True)
+        if len(html) > 5000 and len(body_text) < 200:
+            return True
+        if body_text.strip() in ("", "Loading...", "Please wait"):
+            return True
 
-        # Heuristic: many scripts + very little visible text = JS rendering
         scripts = soup.find_all("script")
         if len(scripts) > 30 and len(body_text) < 500 and len(html) > 100000:
             return True
 
-        # Heuristic: if HTML is large but visible text (excluding scripts) is tiny, likely JS-rendered
-        # Remove script content from body text for accurate count
         for script in scripts:
             script.decompose()
-        visible_text = body.get_text(strip=True) if body else ""
+        visible_text = body.get_text(strip=True)
         if len(html) > 80000 and len(visible_text) < 1500:
             return True
-
         return False
 
     def _extract_title(self, soup: BeautifulSoup) -> str:
-        """Extract page title."""
-        # Try <title>
         title_tag = soup.find("title")
         if title_tag and title_tag.string:
             return title_tag.string.strip()
-
-        # Try og:title
         og = soup.find("meta", property="og:title")
         if og and og.get("content"):
             return og["content"].strip()
-
         return ""
 
     def _extract_description(self, soup: BeautifulSoup) -> str:
-        """Extract page description."""
-        # Try meta description
         meta = soup.find("meta", attrs={"name": "description"})
         if meta and meta.get("content"):
             return meta["content"].strip()
-
-        # Try og:description
         og = soup.find("meta", property="og:description")
         if og and og.get("content"):
             return og["content"].strip()
-
         return ""
 
     def _extract_links(self, soup: BeautifulSoup, base_url: str) -> list[dict]:
-        """Extract links from page."""
         links = []
         seen = set()
         for a in soup.find_all("a", href=True):
             href = a["href"]
             text = (a.get_text(strip=True) or "")[:100]
-            # Normalize
             try:
                 full = urljoin(base_url, href)
-                # Skip non-HTTP
                 if not full.startswith(("http://", "https://")):
                     continue
-                # Skip anchors
-                if "#" in full and full.index("#") < full.index("://") + 5:
+                if href.startswith("#"):
                     continue
                 if full in seen:
                     continue
@@ -362,7 +416,6 @@ class Scraper:
         return links[:200]
 
     def _extract_structured_data(self, soup: BeautifulSoup) -> Optional[dict]:
-        """Extract JSON-LD structured data."""
         for script in soup.find_all("script", type="application/ld+json"):
             try:
                 return json.loads(script.string or "{}")
@@ -372,10 +425,8 @@ class Scraper:
 
 
 def _html_to_markdown(html: str) -> str:
-    """Convert HTML to clean Markdown."""
     if not html:
         return ""
-
     md = markdownify(
         html,
         heading_style="ATX",
@@ -384,8 +435,6 @@ def _html_to_markdown(html: str) -> str:
         bullets="-",
         max_title_length=0,
     )
-
-    # Clean up excessive whitespace
     lines = [line.rstrip() for line in md.split("\n")]
     cleaned = []
     blank_count = 0
@@ -397,5 +446,4 @@ def _html_to_markdown(html: str) -> str:
         else:
             blank_count = 0
             cleaned.append(line)
-
     return "\n".join(cleaned).strip()

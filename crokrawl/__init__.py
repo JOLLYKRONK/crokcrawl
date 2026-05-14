@@ -1,3 +1,3 @@
-"""crokrawl — Open-source Firecrawl replacement."""
+"""crokcrawl — Open-source Firecrawl replacement."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.1"
