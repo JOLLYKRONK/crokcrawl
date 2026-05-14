@@ -78,3 +78,5 @@ if backend == "crokrawl":
 ```
 
 Or set `FIRECRAWL_API_URL=http://localhost:8000` — the existing Firecrawl client code will work with crokrawl's compatible API.
+
+kronk test
