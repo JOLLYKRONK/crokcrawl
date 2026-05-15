@@ -7,6 +7,7 @@ For JS-rendered pages (SPAs), uses Playwright Chromium when enabled.
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional, Any
@@ -18,12 +19,18 @@ from markdownify import markdownify
 from readability import Document
 
 from crokcrawl.url_validation import is_safe_url
-from crokcrawl.stealth import STEALTH_INIT_SCRIPT, STEALTH_ARGS
+
+# Stealth evasions via undetected_playwright's Malenia
+try:
+    from undetected_playwright.tarnished import Malenia
+    HAS_UNDETECTED = True
+except Exception:
+    HAS_UNDETECTED = False
 
 
 logger = logging.getLogger(__name__)
 
-# HTML patterns that are likely JS-rendered (SPA detection)
+# HTML patterns that likely JS-rendered (SPA detection)
 SPA_INDICATORS = [
     'id="__next"',
     '__NEXT_DATA__',
@@ -34,6 +41,92 @@ SPA_INDICATORS = [
     'angular-version',
     'vue-app',
 ]
+
+# Randomized browser fingerprint profiles — rotate across these to avoid
+# fingerprint-based detection. Each profile has distinct viewport, locale,
+# timezone, and Accept-Language headers.
+FINGERPRINT_PROFILES = [
+    {
+        "viewport": {"width": 1920, "height": 1080},
+        "locale": "en-US",
+        "timezone": "America/New_York",
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "extra_headers": {
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    },
+    {
+        "viewport": {"width": 1366, "height": 768},
+        "locale": "en-GB",
+        "timezone": "Europe/London",
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "extra_headers": {
+            "Accept-Language": "en-GB,en;q=0.9",
+        },
+    },
+    {
+        "viewport": {"width": 1536, "height": 864},
+        "locale": "de-DE",
+        "timezone": "Europe/Berlin",
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "extra_headers": {
+            "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+        },
+    },
+    {
+        "viewport": {"width": 1440, "height": 900},
+        "locale": "fr-FR",
+        "timezone": "Europe/Paris",
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+        "extra_headers": {
+            "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+        },
+    },
+    {
+        "viewport": {"width": 1600, "height": 900},
+        "locale": "en-CA",
+        "timezone": "America/Toronto",
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "extra_headers": {
+            "Accept-Language": "en-CA,en;q=0.9",
+        },
+    },
+]
+
+# Stealth launch args — anti-detection flags passed to Chromium
+STEALTH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-infobars",
+    "--disable-dev-shm-usage",
+    "--no-sandbox",
+    "--disable-features=VizDisplayCompositor",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-sync",
+    "--disable-translate",
+    "--mute-audio",
+]
+
+# Domains known to always require JS rendering — SPA detection fails on these
+# because they return pre-rendered shells with enough text to pass detection checks.
+KNOWN_JS_HEAVY_DOMAINS = {
+    "github.com": True,
+    "twitter.com": True,
+    "www.twitter.com": True,
+    "x.com": True,
+    "www.x.com": True,
+    "www.reddit.com": True,
+    "linkedin.com": True,
+    "www.linkedin.com": True,
+    "tiktok.com": True,
+    "www.tiktok.com": True,
+    "instagram.com": True,
+    "www.instagram.com": True,
+    "facebook.com": True,
+    "www.facebook.com": True,
+    "youtube.com": True,
+    "www.youtube.com": True,
+}
 
 
 @dataclass
@@ -81,19 +174,21 @@ class Scraper:
         self._playwright = None
         self._js_render_available = False
 
+    def _new_fingerprint(self):
+        """Return a random fingerprint profile to reduce fingerprint-based detection."""
+        import random
+        return random.choice(FINGERPRINT_PROFILES)
+
     async def start(self):
         """Initialize scraper and optionally launch Playwright browser with anti-detection."""
         if self.config.js_render:
             try:
                 from playwright.async_api import async_playwright
                 self._playwright = await async_playwright().start()
-                if self.config.stealth:
-                    launch_kwargs = {
-                        "headless": self.config.headless,
-                        "args": STEALTH_ARGS,
-                    }
-                else:
-                    launch_kwargs = {"headless": self.config.headless}
+                launch_kwargs = {
+                    "headless": self.config.headless,
+                    "args": STEALTH_ARGS,
+                }
 
                 # Try to use system Chrome first, fall back to bundled
                 system_chrome = os.environ.get(
@@ -108,17 +203,25 @@ class Scraper:
                     launch_kwargs["executable_path"] = "/usr/bin/google-chrome"
 
                 self._browser = await self._playwright.chromium.launch(**launch_kwargs)
+
+                # Create a fresh fingerprint context for each session
+                fp = self._new_fingerprint()
                 self._context = await self._browser.new_context(
-                    user_agent=self._client.headers.get("User-Agent"),
-                    viewport={"width": 1920, "height": 1080},
-                    locale="en-US",
-                    timezone_id="America/New_York",
+                    user_agent=fp["ua"],
+                    viewport=fp["viewport"],
+                    locale=fp["locale"],
+                    timezone_id=fp["timezone"],
                     permissions=["geolocation"],
+                    extra_http_headers=fp["extra_headers"],
                 )
-                if self.config.stealth:
-                    await self._context.add_init_script(STEALTH_INIT_SCRIPT)
+                # Apply Malenia stealth evasions (puppeteer-extra-plugin-stealth)
+                if self.config.stealth and HAS_UNDETECTED:
+                    await Malenia.apply_stealth(self._context)
                 self._js_render_available = True
-                logger.info("Playwright browser initialized for JS rendering (stealth=%s)", self.config.stealth)
+                logger.info(
+                    "Playwright browser initialized for JS rendering (stealth=%s, fingerprint=%s/%s)",
+                    self.config.stealth, fp["locale"], fp["timezone"],
+                )
             except Exception as e:
                 logger.warning("Playwright unavailable, falling back to httpx only: %s", e)
                 self._js_render_available = False
@@ -167,6 +270,12 @@ class Scraper:
             return result
 
         effective_js_render = render_js if render_js is not None else self.config.js_render
+
+        # Force JS rendering for known JS-heavy domains (GitHub, Twitter, etc.)
+        # regardless of SPA detection — their pre-rendered shells fool the detector.
+        parsed_url = urlparse(url)
+        if parsed_url.netloc in KNOWN_JS_HEAVY_DOMAINS:
+            effective_js_render = True
         effective_wait = wait_ms if wait_ms is not None else self.config.wait_for
 
         # Determine wait_for_selector based on URL patterns
@@ -208,7 +317,9 @@ class Scraper:
 
                 # Re-fetch with Playwright if JS-rendered and browser available
                 is_spa = self._is_js_rendered(html, response)
-                if effective_js_render and is_spa:
+                # Also use browser for known JS-heavy domains regardless of SPA detection
+                is_js_heavy = parsed_url.netloc in KNOWN_JS_HEAVY_DOMAINS
+                if effective_js_render and (is_spa or is_js_heavy):
                     if self._context:
                         browser_html, raw_text, final = await self._fetch_with_browser(
                             url, wait_ms=effective_wait, wait_for_selector=wait_for_selector
@@ -361,49 +472,153 @@ class Scraper:
         Fetch URL via Playwright browser. Waits for JS-rendered content.
 
         Uses 'domcontentloaded' first to avoid Cloudflare JS challenge stalls,
-        then waits explicitly for content. If Cloudflare block detected, retries
-        with longer wait. If wait_for_selector is provided, waits for that CSS
-        selector to appear before capturing content.
+        then waits explicitly for content. Falls back to curl-impersonate on
+        empty/bocked responses. Retries up to 2 times with fresh fingerprints.
 
         Returns: (html, raw_text, final_url)
         """
         if not self._context:
             return "", "", url
-        try:
-            page = await self._context.new_page()
-            # Use domcontentloaded instead of networkidle — Cloudflare challenges
-            # sometimes prevent networkidle from ever firing
-            await page.goto(url, wait_until="domcontentloaded", timeout=self.config.timeout * 1000)
 
-            # Wait for JS challenge to resolve or dynamic content to load
-            if wait_ms > 0:
-                await page.wait_for_timeout(wait_ms)
+        last_error = None
+        for attempt in range(3):
+            try:
+                # Each retry gets a fresh fingerprint profile + new context
+                if attempt > 0:
+                    fp = self._new_fingerprint()
+                    ctx = await self._browser.new_context(
+                        user_agent=fp["ua"],
+                        viewport=fp["viewport"],
+                        locale=fp["locale"],
+                        timezone_id=fp["timezone"],
+                        permissions=["geolocation"],
+                        extra_http_headers=fp["extra_headers"],
+                    )
+                    if self.config.stealth and HAS_UNDETECTED:
+                        await Malenia.apply_stealth(ctx)
+                else:
+                    ctx = self._context
 
-            # Wait for a specific DOM element if provided (e.g., commit lists)
-            if wait_for_selector:
-                try:
-                    await page.wait_for_selector(wait_for_selector, timeout=15000)
-                except Exception:
-                    logger.debug("wait_for_selector '%s' not found, continuing", wait_for_selector)
+                page = await ctx.new_page()
+                await page.goto(url, wait_until="domcontentloaded", timeout=self.config.timeout * 1000)
 
-            # Check if we got a Cloudflare block page
-            html_data = await page.content()
-            is_cf_block = "Cloudflare" in html_data or "blocked" in html_data[:2000].lower()
+                if wait_ms > 0:
+                    await page.wait_for_timeout(wait_ms)
 
-            if is_cf_block:
-                logger.info("Cloudflare challenge detected, waiting longer for resolution...")
-                await page.wait_for_timeout(10000)
+                if wait_for_selector:
+                    try:
+                        await page.wait_for_selector(wait_for_selector, timeout=15000)
+                    except Exception:
+                        logger.debug("wait_for_selector '%s' not found, continuing", wait_for_selector)
+
                 html_data = await page.content()
+                is_cf_block = "Cloudflare" in html_data or "blocked" in html_data[:2000].lower()
+                if is_cf_block:
+                    logger.info("Cloudflare challenge detected on attempt %d, retrying...", attempt + 1)
+                    await page.close()
+                    await ctx.close()
+                    last_error = "Cloudflare challenge"
+                    continue
 
-            # Get raw visible text — what a human sees on the page
-            raw_text = await page.inner_text("body")
+                raw_text = await page.inner_text("body")
+                final_url = page.url
+                await page.close()
+                if attempt > 0:
+                    await ctx.close()
+                return html_data, raw_text, final_url
+            except Exception as e:
+                last_error = e
+                logger.debug("Browser fetch attempt %d failed for %s: %s", attempt + 1, url, e)
 
-            final_url = page.url
-            await page.close()
-            return html_data, raw_text, final_url
-        except Exception as e:
-            logger.error("Browser fetch error for %s: %s", url, e)
+        # All Playwright attempts failed — fall back to curl-impersonate
+        logger.info("Playwright failed for %s, falling back to curl-impersonate", url)
+        html, raw_text, final_url = await self._fetch_with_curl_impersonate(url)
+        if html:
+            return html, raw_text, final_url
+
+        logger.error("All browser fetch attempts failed for %s: %s", url, last_error)
+        return "", "", url
+
+    def _get_curl_curl_impersonate_path(self) -> str | None:
+        """Locate curl-impersonate binary."""
+        import shutil
+        path = shutil.which("curl-impersonate")
+        if path:
+            return path
+        for candidate in [
+            "/usr/local/bin/curl-impersonate",
+            "/usr/bin/curl-impersonate",
+            "~/.local/bin/curl-impersonate",
+        ]:
+            import os
+            if os.path.exists(os.path.expanduser(candidate)):
+                return os.path.expanduser(candidate)
+        return None
+
+    async def _fetch_with_curl_impersonate(self, url: str) -> tuple[str, str, str]:
+        """
+        Fetch URL using curl-impersonate with real Chrome TLS/HTTP2 fingerprints.
+
+        curl-impersonate impersonates Chrome's TLS handshake, HTTP/2 headers,
+        and cipher suites — making the request look like a real browser even
+        though it's a simple HTTP fetch. Works on sites that block headless
+        Chrome but don't check JS execution.
+
+        Returns: (html, raw_text, final_url)
+        """
+        curl_path = self._get_curl_curl_impersonate_path()
+        if not curl_path:
             return "", "", url
+
+        import subprocess, tempfile, os, asyncio
+        # Write page content to temp file
+        with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="wb") as f:
+            tmpfile = f.name
+
+        try:
+            # curl-impersonate with Chrome fingerprints
+            # -L: follow redirects
+            # -s: silent
+            # -o: output file
+            # --tlsv1.2: TLS version
+            # -k: accept cert errors (for anti-bot cert mismatches)
+            cmd = [
+                curl_path,
+                "-L",
+                "-s",
+                "-o", tmpfile,
+                "--tlsv1.2",
+                "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "-H", "Accept-Language: en-US,en;q=0.9",
+                "--noproxy", "*",  # force direct connection
+                url,
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+            with open(tmpfile, "r", errors="replace") as f:
+                html = f.read()
+            if html and len(html) > 100:
+                # Extract title from first <title> tag
+                title_match = re.search(r"<title[^>]*>([^<]+)</title>", html, re.IGNORECASE)
+                title = title_match.group(1) if title_match else ""
+                # Basic raw_text extraction
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(html, "lxml")
+                raw_text = soup.get_text(separator=" ", strip=True)[:5000]
+                return html, raw_text, url
+        except Exception as e:
+            logger.debug("curl-impersonate failed for %s: %s", url, e)
+        finally:
+            try:
+                os.unlink(tmpfile)
+            except Exception:
+                pass
+        return "", "", url
 
     async def map_urls(self, url: str, max_depth: int = 2, max_urls: int = 1000) -> list[str]:
         """Discover URLs on a domain without scraping content."""

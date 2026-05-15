@@ -217,8 +217,8 @@ wheels = [
 ]
 
 [[package]]
-name = "crokrawl"
-version = "0.1.0"
+name = "crokcrawl"
+version = "0.2.1"
 source = { editable = "." }
 dependencies = [
     { name = "aiofiles" },
@@ -227,7 +227,6 @@ dependencies = [
     { name = "dnspython" },
     { name = "fastapi" },
     { name = "httpx" },
-    { name = "lxml-html-clean" },
     { name = "markdownify" },
     { name = "pydantic" },
     { name = "readability-lxml" },
@@ -243,7 +242,6 @@ requires-dist = [
     { name = "dnspython", specifier = ">=2.7" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.28" },
-    { name = "lxml-html-clean", specifier = ">=0.4" },
     { name = "markdownify", specifier = ">=0.13" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "readability-lxml", specifier = ">=0.8" },
